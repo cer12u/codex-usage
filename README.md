@@ -130,6 +130,17 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
 - フォーマット/型チェックは特に依存なし。必要に応じて `ruff`/`black` 等をお好みで導入してください。
 - 機能要望: 期間指定（`--from/--to`）、日別×モデル別集計（`--by-model`）など拡張可能です。
 
+### Tests（サンプルベース）
+- 依存: `pytest` がある環境で実行可能です。
+- 実行例:
+  ```bash
+  pytest -q
+  ```
+- テスト内容:
+  - `tests/test_parsing.py`: ログ行→イベントのパース（`iter_events`）
+  - `tests/test_costing.py`: 単価正規化とコスト算出（`compute_cost_usd`, `summarize_with_cost`）
+  - `tests/test_sessions.py`: usage limit/5hギャップ→最初のアクティビティで起点をラッチするロジック（`update_session_state_with_line`, `tail_first_activity_after`）
+
 ## Run via npx / uv
 - npx（Node ラッパーが Python CLI を起動します）
   ```bash
