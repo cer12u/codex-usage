@@ -108,9 +108,9 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
 
 ## Live セッション表示（デフォルト）
 - 起点の決定（暫定ロジック）
-  - usage limit エラーが出た「次の」SessionConfigured を起点に採用
-  - または、直前のログ行から5時間以上空いて出た SessionConfigured を起点に採用
-  - 起動時に起点が未確定のときは、「現在 − 5時間」以降で最も古い SessionConfigured を起点に固定（見つからない場合は起点未設定で N/A）
+  - usage limit エラーの後に発生した「最初のアクティビティ（ExecCommandBegin/TaskStarted/TokenCount）」を起点に採用
+  - または、直前のログ行から5時間以上の無活動ギャップ後に発生した「最初のアクティビティ」を起点に採用
+  - 起動時に起点が未確定のときは、「現在 − 5時間」以降で最も古いアクティビティを起点に固定（見つからない場合は起点未設定で N/A）
 - セッションの長さ: 起点から 5 時間で固定（起点はスライドしません）
   - 5時間に達したら集計を止め、次のトリガ（usage limit→SessionConfigured、または5hギャップ→SessionConfigured）まで N/A 行を表示
 - 表示項目: `start — end`, `duration`, `input (cached)`, `output (reasoning)`, `total`, `$`, 横棒グラフ

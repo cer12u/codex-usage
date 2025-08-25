@@ -45,6 +45,11 @@ EVENT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\S+\s+\w+\s+handle_codex_event:\s+Tok
 MODEL_RE = re.compile(r"SessionConfigured\(.*?model:\s*\"([^\"]+)\"", re.IGNORECASE)
 SESSION_CONFIG_RE = re.compile(r"handle_codex_event:\s+SessionConfigured\(SessionConfiguredEvent\b", re.IGNORECASE)
 USAGE_LIMIT_RE = re.compile(r"handle_codex_event:\s+Error\(ErrorEvent\b.*?usage\s+limit", re.IGNORECASE)
+ACTIVITY_RE = re.compile(
+    r"handle_codex_event:\s+(?:ExecCommandBegin\(|TaskStarted\b|TokenCount\(TokenUsage\b)",
+    re.IGNORECASE,
+)
+RESUME_RE = re.compile(r"\bresume_path:\s*None\b", re.IGNORECASE)
 
 
 def parse_number(field: str, line: str, default: int = 0) -> int:
@@ -322,7 +327,14 @@ def detect_session_starts_and_state(log_path: str) -> Dict[str, Any]:
     2) A SessionConfigured where the gap from the previous log line is >= 5 hours.
     Returns a dict with keys: session_start (datetime|None), last_ts (datetime|None), usage_limit_pending (bool)
     """
-    state: Dict[str, Any] = {"session_start": None, "last_ts": None, "usage_limit_pending": False, "last_session_configured": None}
+    state: Dict[str, Any] = {
+        "session_start": None,
+        "session_end": None,
+        "last_ts": None,
+        "usage_limit_pending": False,
+        "last_session_configured": None,
+        "resume_pending": False,
+    }
     try:
         with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
             for raw in f:
@@ -333,18 +345,30 @@ def detect_session_starts_and_state(log_path: str) -> Dict[str, Any]:
                 # Rule (a): mark pending when usage limit error appears
                 if USAGE_LIMIT_RE.search(line):
                     state["usage_limit_pending"] = True
-                # Rule (b): on SessionConfigured, check pending or gap>=5h
-                if SESSION_CONFIG_RE.search(line):
+                if RESUME_RE.search(line):
+                    state["resume_pending"] = True
+                # Rule (b): if an ACTIVITY arrives with usage_limit_pending or 5h gap -> start
+                if ACTIVITY_RE.search(line):
                     if state.get("usage_limit_pending"):
                         state["session_start"] = dt
+                        state["session_end"] = (dt + timedelta(hours=5)) if dt else None
                         state["usage_limit_pending"] = False
+                        state["resume_pending"] = False
                     else:
                         last_dt = state.get("last_ts")
                         if last_dt is not None and dt is not None and (dt - last_dt) >= timedelta(hours=5):
                             state["session_start"] = dt
-                    # track most recent SessionConfigured regardless
-                    if dt is not None:
-                        state["last_session_configured"] = dt
+                            state["session_end"] = dt + timedelta(hours=5)
+                        elif state.get("resume_pending") and dt is not None:
+                            # treat resume hint + first activity as a candidate start
+                            # only if we don't already have a session
+                            if state.get("session_start") is None:
+                                state["session_start"] = dt
+                                state["session_end"] = dt + timedelta(hours=5)
+                            state["resume_pending"] = False
+                # Track most recent SessionConfigured (optional)
+                if SESSION_CONFIG_RE.search(line) and dt is not None:
+                    state["last_session_configured"] = dt
                 if dt is not None:
                     state["last_ts"] = dt
     except Exception:
@@ -360,25 +384,29 @@ def update_session_state_with_line(state: Dict[str, Any], raw_line: str) -> None
     dt = parse_ts(ts)
     if USAGE_LIMIT_RE.search(line):
         state["usage_limit_pending"] = True
-    if SESSION_CONFIG_RE.search(line):
+    if RESUME_RE.search(line):
+        state["resume_pending"] = True
+    if ACTIVITY_RE.search(line):
         if state.get("usage_limit_pending"):
             state["session_start"] = dt
-            if dt is not None:
-                state["session_end"] = dt + timedelta(hours=5)
+            state["session_end"] = (dt + timedelta(hours=5)) if dt else None
             state["usage_limit_pending"] = False
+            state["resume_pending"] = False
         else:
             last_dt = state.get("last_ts")
             if last_dt is not None and dt is not None and (dt - last_dt) >= timedelta(hours=5):
                 state["session_start"] = dt
                 state["session_end"] = dt + timedelta(hours=5)
-        if dt is not None:
-            state["last_session_configured"] = dt
+            elif state.get("resume_pending") and dt is not None and state.get("session_start") is None:
+                state["session_start"] = dt
+                state["session_end"] = dt + timedelta(hours=5)
+                state["resume_pending"] = False
     if dt is not None:
         state["last_ts"] = dt
 
 
-def tail_first_session_configured_after(log_path: str, base_dt: datetime, tail_lines: int = 50000) -> Optional[datetime]:
-    """Scan only the tail of the log to find the earliest SessionConfigured at/after base_dt.
+def tail_first_activity_after(log_path: str, base_dt: datetime, tail_lines: int = 50000) -> Optional[datetime]:
+    """Scan only the tail of the log to find the earliest ACTIVITY at/after base_dt.
     Returns that datetime or None when not found.
     """
     try:
@@ -390,7 +418,7 @@ def tail_first_session_configured_after(log_path: str, base_dt: datetime, tail_l
         candidate: Optional[datetime] = None
         for raw in dq:
             line = strip_ansi(raw.rstrip("\n"))
-            if not SESSION_CONFIG_RE.search(line):
+            if not ACTIVITY_RE.search(line):
                 continue
             ts_match = TS_RE.search(line)
             ts = ts_match.group(1) if ts_match else ""
@@ -1229,8 +1257,8 @@ def run_live_sessions(log_path: str, args: argparse.Namespace, prices_conf: Opti
         # Initialize fixed session window once unless updated by triggers
         if session_state.get("session_start") is None and session_state.get("session_end") is None:
             base = now - timedelta(hours=5)
-            # Pick the oldest SessionConfigured within the last 5h as the fixed origin
-            init_start = tail_first_session_configured_after(log_path, base_dt=base)
+            # Pick the oldest ACTIVITY within the last 5h as the fixed origin
+            init_start = tail_first_activity_after(log_path, base_dt=base)
             if init_start is not None:
                 session_state["session_start"] = init_start
                 session_state["session_end"] = init_start + timedelta(hours=5)
