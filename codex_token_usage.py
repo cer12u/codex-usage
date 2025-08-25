@@ -43,6 +43,8 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\S+?)\s")
 EVENT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\S+\s+\w+\s+handle_codex_event:\s+TokenCount\(TokenUsage\b")
 MODEL_RE = re.compile(r"SessionConfigured\(.*?model:\s*\"([^\"]+)\"", re.IGNORECASE)
+SESSION_CONFIG_RE = re.compile(r"handle_codex_event:\s+SessionConfigured\(SessionConfiguredEvent\b", re.IGNORECASE)
+USAGE_LIMIT_RE = re.compile(r"handle_codex_event:\s+Error\(ErrorEvent\b.*?usage\s+limit", re.IGNORECASE)
 
 
 def parse_number(field: str, line: str, default: int = 0) -> int:
@@ -305,6 +307,112 @@ def render_table(headers: List[str], rows: List[List[Any]], border: str = "unico
         out.write(fmt_row(sr) + "\n")
     # Bottom border
     out.write(line(bl, bc, br) + "\n")
+
+
+def local_tzinfo():
+    try:
+        return datetime.now().astimezone().tzinfo or timezone.utc
+    except Exception:
+        return timezone.utc
+
+
+def detect_session_starts_and_state(log_path: str) -> Dict[str, Any]:
+    """Scan the log once to detect the latest 5h session start based on rules:
+    1) The SessionConfigured immediately after a 'usage limit' error.
+    2) A SessionConfigured where the gap from the previous log line is >= 5 hours.
+    Returns a dict with keys: session_start (datetime|None), last_ts (datetime|None), usage_limit_pending (bool)
+    """
+    state: Dict[str, Any] = {"session_start": None, "last_ts": None, "usage_limit_pending": False, "last_session_configured": None}
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = strip_ansi(raw.rstrip("\n"))
+                ts_match = TS_RE.search(line)
+                ts = ts_match.group(1) if ts_match else ""
+                dt = parse_ts(ts)
+                # Rule (a): mark pending when usage limit error appears
+                if USAGE_LIMIT_RE.search(line):
+                    state["usage_limit_pending"] = True
+                # Rule (b): on SessionConfigured, check pending or gap>=5h
+                if SESSION_CONFIG_RE.search(line):
+                    if state.get("usage_limit_pending"):
+                        state["session_start"] = dt
+                        state["usage_limit_pending"] = False
+                    else:
+                        last_dt = state.get("last_ts")
+                        if last_dt is not None and dt is not None and (dt - last_dt) >= timedelta(hours=5):
+                            state["session_start"] = dt
+                    # track most recent SessionConfigured regardless
+                    if dt is not None:
+                        state["last_session_configured"] = dt
+                if dt is not None:
+                    state["last_ts"] = dt
+    except Exception:
+        pass
+    return state
+
+
+def update_session_state_with_line(state: Dict[str, Any], raw_line: str) -> None:
+    """Incrementally update session state with a new log line."""
+    line = strip_ansi(raw_line.rstrip("\n"))
+    ts_match = TS_RE.search(line)
+    ts = ts_match.group(1) if ts_match else ""
+    dt = parse_ts(ts)
+    if USAGE_LIMIT_RE.search(line):
+        state["usage_limit_pending"] = True
+    if SESSION_CONFIG_RE.search(line):
+        if state.get("usage_limit_pending"):
+            state["session_start"] = dt
+            if dt is not None:
+                state["session_end"] = dt + timedelta(hours=5)
+            state["usage_limit_pending"] = False
+        else:
+            last_dt = state.get("last_ts")
+            if last_dt is not None and dt is not None and (dt - last_dt) >= timedelta(hours=5):
+                state["session_start"] = dt
+                state["session_end"] = dt + timedelta(hours=5)
+        if dt is not None:
+            state["last_session_configured"] = dt
+    if dt is not None:
+        state["last_ts"] = dt
+
+
+def tail_first_session_configured_after(log_path: str, base_dt: datetime, tail_lines: int = 50000) -> Optional[datetime]:
+    """Scan only the tail of the log to find the earliest SessionConfigured at/after base_dt.
+    Returns that datetime or None when not found.
+    """
+    try:
+        from collections import deque as _deque
+        dq = _deque(maxlen=tail_lines)
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                dq.append(raw)
+        candidate: Optional[datetime] = None
+        for raw in dq:
+            line = strip_ansi(raw.rstrip("\n"))
+            if not SESSION_CONFIG_RE.search(line):
+                continue
+            ts_match = TS_RE.search(line)
+            ts = ts_match.group(1) if ts_match else ""
+            dt = parse_ts(ts)
+            if dt is None:
+                continue
+            if dt >= base_dt and (candidate is None or dt < candidate):
+                candidate = dt
+        return candidate
+    except Exception:
+        return None
+
+
+def first_event_dt_after(base_dt: datetime, events: List[Dict[str, Any]]) -> Optional[datetime]:
+    cand: Optional[datetime] = None
+    for ev in events:
+        dt = parse_ts(str(ev.get("ts", "")))
+        if dt is None:
+            continue
+        if dt >= base_dt and (cand is None or dt < cand):
+            cand = dt
+    return cand
 
 
 def summarize(events: Iterable[Dict[str, object]]) -> Dict[str, int]:
@@ -966,7 +1074,8 @@ def run_live(log_path: str, args: argparse.Namespace, prices_conf: Optional[Dict
 
         # Render
         sys.stdout.write("\x1b[2J\x1b[H")  # clear screen, cursor home
-        title = f"Live (last {window_hours}h) — {now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        lt = local_tzinfo()
+        title = f"Live (last {window_hours}h) — {now.astimezone(lt).strftime('%Y-%m-%d %H:%M:%S %Z')}"
         print(title)
         # Summary row included in table
         if prices_conf or getattr(args, 'forced_model', None):
@@ -977,6 +1086,225 @@ def run_live(log_path: str, args: argparse.Namespace, prices_conf: Optional[Dict
         write_events_table(filtered, include_model=args.include_model, header=not args.no_header, border=args.border, summary=s)
 
         # Sleep until next refresh
+        time.sleep(refresh_sec)
+
+    f.close()
+    return 0
+
+
+def build_sessions(events: List[Dict[str, Any]], gap_minutes: int) -> List[Dict[str, Any]]:
+    """Group chronologically ordered events into sessions by inactivity gap.
+    Returns a list of sessions with totals, cost, start/end, and duration.
+    """
+    if not events:
+        return []
+    # Ensure chronological order by timestamp
+    def ev_dt(ev: Dict[str, Any]) -> Optional[datetime]:
+        return parse_ts(str(ev.get("ts", "")))
+
+    evs = [e for e in events if ev_dt(e) is not None]
+    evs.sort(key=lambda e: ev_dt(e))
+    sessions: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+    last_dt: Optional[datetime] = None
+    gap = timedelta(minutes=gap_minutes)
+
+    for ev in evs:
+        dt = ev_dt(ev)  # type: ignore[assignment]
+        if dt is None:
+            continue
+        if cur is None:
+            cur = {
+                "start": dt,
+                "end": dt,
+                "events": 0,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            }
+        else:
+            # If gap exceeded, close session and start a new one
+            if last_dt is not None and dt - last_dt > gap:
+                sessions.append(cur)
+                cur = {
+                    "start": dt,
+                    "end": dt,
+                    "events": 0,
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                }
+        # accumulate
+        cur["events"] += 1  # type: ignore[index]
+        cur["end"] = dt  # type: ignore[index]
+        cur["input_tokens"] += int(ev.get("input_tokens", 0) or 0)  # type: ignore[index]
+        cur["cached_input_tokens"] += int(ev.get("cached_input_tokens", 0) or 0)  # type: ignore[index]
+        cur["output_tokens"] += int(ev.get("output_tokens", 0) or 0)  # type: ignore[index]
+        cur["reasoning_output_tokens"] += int(ev.get("reasoning_output_tokens", 0) or 0)  # type: ignore[index]
+        cur["total_tokens"] += int(ev.get("total_tokens", 0) or 0)  # type: ignore[index]
+        cur["cost_usd"] += float(ev.get("__cost_usd", 0.0) or 0.0)  # type: ignore[index]
+        last_dt = dt
+
+    if cur is not None:
+        sessions.append(cur)
+
+    # Add gap_to_next_sec for each session (except last)
+    for i in range(len(sessions) - 1):
+        cur_end = sessions[i]["end"]
+        next_start = sessions[i + 1]["start"]
+        sessions[i]["gap_to_next_sec"] = int((next_start - cur_end).total_seconds())
+    if sessions:
+        sessions[-1]["gap_to_next_sec"] = None
+
+    # Add duration
+    for s in sessions:
+        s["duration_sec"] = int((s["end"] - s["start"]).total_seconds())
+    return sessions
+
+
+def run_live_sessions(log_path: str, args: argparse.Namespace, prices_conf: Optional[Dict[str, Any]]) -> int:
+    """Live view focused on the latest official 5h session (usage-limit based).
+    Determine session_start by rules:
+      (1) usage limit error -> next SessionConfigured()
+      (2) gap >= 5h before a SessionConfigured()
+    Then aggregate from session_start to now, and render a single row with a bar.
+    """
+    refresh_sec = 2
+    fallback_hours = args.since_hours or 5
+
+    # Ensure we have costs on events
+    def annotate_cost(ev: Dict[str, Any]) -> None:
+        model = str(ev.get("model") or "")
+        rates = effective_rates(model, prices_conf or {}, getattr(args, 'forced_model', None))
+        ev["__cost_usd"] = compute_cost_usd(ev, rates, use_cached_pricing=getattr(args, 'cached_pricing', False))
+
+    # Initial scan for session state and load initial events
+    session_state = detect_session_starts_and_state(log_path)
+    events: List[Dict[str, Any]] = []
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for ev in iter_events(f, include_model=args.include_model):
+                events.append(ev)
+    except Exception as e:
+        print(f"Error opening log: {e}", file=sys.stderr)
+        return 1
+
+    # Prepare tail
+    try:
+        f = open(log_path, "r", encoding="utf-8", errors="ignore")
+        f.seek(0, os.SEEK_END)
+    except Exception as e:
+        print(f"Error tailing log: {e}", file=sys.stderr)
+        return 1
+
+    running = True
+
+    def _stop(signum, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    while running:
+        # Consume new lines
+        while True:
+            pos = f.tell()
+            line = f.readline()
+            if not line:
+                f.seek(pos)
+                break
+            # Update session state from raw log line
+            update_session_state_with_line(session_state, line)
+            for ev in iter_events([line], include_model=args.include_model):
+                events.append(ev)
+
+        now = datetime.now(timezone.utc)
+        # Initialize fixed session window once unless updated by triggers
+        if session_state.get("session_start") is None and session_state.get("session_end") is None:
+            base = now - timedelta(hours=5)
+            # Pick the oldest SessionConfigured within the last 5h as the fixed origin
+            init_start = tail_first_session_configured_after(log_path, base_dt=base)
+            if init_start is not None:
+                session_state["session_start"] = init_start
+                session_state["session_end"] = init_start + timedelta(hours=5)
+
+        since_dt = session_state.get("session_start")
+        end_dt = session_state.get("session_end")
+        up_to = min(now, end_dt) if isinstance(end_dt, datetime) else now
+        if since_dt is not None:
+            window_events = [
+                ev for ev in events
+                if (parse_ts(str(ev.get("ts", ""))) or now) >= since_dt and (parse_ts(str(ev.get("ts", ""))) or now) <= up_to
+            ]
+        else:
+            window_events = []
+        # Annotate costs
+        if prices_conf or getattr(args, 'forced_model', None):
+            for ev in window_events:
+                annotate_cost(ev)
+
+        # Summarize current session window
+        if prices_conf or getattr(args, 'forced_model', None):
+            s = summarize_with_cost(window_events, prices_conf or {}, per_model=False, forced_model=getattr(args, 'forced_model', None), use_cached_pricing=getattr(args, 'cached_pricing', False))
+        else:
+            s = summarize(window_events)
+        total_tokens = int(s.get("total_tokens", 0) or 0)
+        total_cost = float(s.get("cost_usd", 0.0) or 0.0)
+
+        # Compute scale for single bar (relative to rolling fallback window tokens/cost)
+        bar_width = 42
+        def bar(v: float, vmax: float) -> str:
+            if vmax <= 0:
+                return ""
+            n = max(1, int((v / vmax) * bar_width)) if v > 0 else 0
+            return "█" * n
+
+        vmax = float(total_cost) if args.session_bar == "cost" else float(total_tokens)
+
+        # Render screen (latest official session only, local timezone)
+        sys.stdout.write("\x1b[2J\x1b[H")
+        lt = local_tzinfo()
+        start_label = since_dt.astimezone(lt).strftime('%Y-%m-%d %H:%M') if since_dt else '—'
+        end_label = end_dt.astimezone(lt).strftime('%H:%M') if isinstance(end_dt, datetime) else now.astimezone(lt).strftime('%H:%M')
+        title = f"Live Session — start {start_label} | end {end_label} | now {now.astimezone(lt).strftime('%H:%M:%S %Z')}"
+        print(title)
+        print()
+        # Header line (latest session only)
+        print("start — end    dur        input (cached)      output (reasoning)    total      $    graph")
+        print("──────────────────────────────────────────────────────────────────────────────────────────────────────")
+
+        if window_events and since_dt is not None:
+            inp = int(s.get("input_tokens", 0) or 0)
+            cached = int(s.get("cached_input_tokens", 0) or 0)
+            outp = int(s.get("output_tokens", 0) or 0)
+            reas = int(s.get("reasoning_output_tokens", 0) or 0)
+            dur_sec = int((up_to - since_dt).total_seconds())
+            dur_str = f"{dur_sec//60:02d}:{dur_sec%60:02d}"
+            b = bar(float(total_cost) if args.session_bar == "cost" else float(total_tokens), vmax if vmax > 0 else 1.0)
+            print(
+                f"{since_dt.astimezone(lt).strftime('%H:%M')}—{up_to.astimezone(lt).strftime('%H:%M')}  {dur_str}   "
+                f"{format_tokens(inp):>8} ({format_tokens(cached):>6})   "
+                f"{format_tokens(outp):>8} ({format_tokens(reas):>6})   "
+                f"{format_tokens(total_tokens):>8}   {total_cost:>6.2f}  {b}"
+            )
+        else:
+            # Avoid an all-zero look: print a minimal header with N/A tokens/cost instead of zeros
+            reference_start = since_dt or (now - timedelta(hours=5))
+            reference_end = (end_dt if isinstance(end_dt, datetime) else now)
+            dur_sec = int((reference_end - reference_start).total_seconds())
+            dur_str = f"{dur_sec//60:02d}:{dur_sec%60:02d}"
+            print(
+                f"{reference_start.astimezone(lt).strftime('%H:%M')}—{reference_end.astimezone(lt).strftime('%H:%M')}  {dur_str}   "
+                f"      — (     —)          — (     —)         —       —    "
+            )
+
         time.sleep(refresh_sec)
 
     f.close()
@@ -1001,7 +1329,15 @@ def main() -> int:
     ap.add_argument("--since-hours", type=int, default=None,
                     help="Only include events in the last N hours (e.g., 5 for live view)")
     ap.add_argument("--live", action="store_true",
-                    help="Live snapshot mode (defaults to last 5 hours when no args)")
+                    help="Live mode (defaults to sessions). With no args, shows last 5 hours")
+    ap.add_argument("--live-sessions", action="store_true",
+                    help="Force live sessions view (default)")
+    ap.add_argument("--live-events", action="store_true",
+                    help="Legacy live events table instead of sessions")
+    ap.add_argument("--session-gap-minutes", type=int, default=10,
+                    help="Inactivity threshold (minutes) to split sessions (default: 10)")
+    ap.add_argument("--session-bar", choices=["tokens", "cost"], default="tokens",
+                    help="Bar chart metric for sessions: total tokens or cost (default: tokens)")
     ap.add_argument("--since-days", type=int, default=None,
                     help="Only include events in the last N days (e.g., 30 for last month)")
     ap.add_argument("--since-date", type=str, default=None,
@@ -1154,7 +1490,10 @@ def main() -> int:
 
     # Emit
     if args.live:
-        return run_live(log_path, args, prices_conf)
+        # Default is sessions; allow opting into legacy events table
+        if args.live_events:
+            return run_live(log_path, args, prices_conf)
+        return run_live_sessions(log_path, args, prices_conf)
     if args.daily:
         rows = aggregate_daily(events)
         # Fill zero rows for missing dates if we have a time window
