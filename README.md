@@ -21,14 +21,14 @@ Codex TUI のログ（既定: `~/.codex/log/codex-tui.log`）から、`TokenCoun
 
 ## Quick Start
 既定の挙動（引数なし / 引数あり）:
-- 引数なし: ライブ表示（直近5時間, 追従）をテーブルで表示（Ctrl-Cで終了）
+- 引数なし: ライブ（セッション）表示をテーブルで表示（2秒ごと再描画, Ctrl-Cで終了）
 - 引数あり（時間指定が無い場合）: 直近30日を日別に月次レポート化（テーブル表示）
 ```bash
-# 引数なし: 直近5時間（ライブ追従表示）
+# 引数なし: ライブ（セッション）表示
 python3 codex_token_usage.py
 
-# ライブの表示幅（時間）を変える
-python3 codex_token_usage.py --since-hours 2   # 直近2時間を追従
+# 旧ライブ（イベント一覧）を見たい場合のみ
+python3 codex_token_usage.py --live --live-events
 
 # モデル名列を含める
 python3 codex_token_usage.py --include-model | head
@@ -96,6 +96,7 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
   - 上記列を枠付きで整形して表示します。
   - 境界線は `--border unicode`（デフォルト）または `--border ascii` が選べます。
   - テーブル表示は列を簡素化: `input (cached)` / `output (reasoning)` / `total` / `cost_usd`
+  - cost_usd は小数点以下2桁、tokens は k/M 接頭辞（例: 1.5k, 2.3M）
 
 - NDJSON は各レコードを1行JSONとして出力します。
 
@@ -104,6 +105,18 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
 - `cached_input_tokens` はキャッシュ読み出し相当のトークン数です。課金有無/単価はモデル依存のため、本ツールでは集計のみ提供します。
 - ログ内の diff/引用文字列に含まれるパターンは除外し、実際の `TokenCount` イベントのみを対象にしています。
 - ログが極端に大きい場合は `--last` を併用するとメモリを節約できます。
+
+## Live セッション表示（デフォルト）
+- 起点の決定（暫定ロジック）
+  - usage limit エラーが出た「次の」SessionConfigured を起点に採用
+  - または、直前のログ行から5時間以上空いて出た SessionConfigured を起点に採用
+  - 起動時に起点が未確定のときは、「現在 − 5時間」以降で最も古い SessionConfigured を起点に固定（見つからない場合は起点未設定で N/A）
+- セッションの長さ: 起点から 5 時間で固定（起点はスライドしません）
+  - 5時間に達したら集計を止め、次のトリガ（usage limit→SessionConfigured、または5hギャップ→SessionConfigured）まで N/A 行を表示
+- 表示項目: `start — end`, `duration`, `input (cached)`, `output (reasoning)`, `total`, `$`, 横棒グラフ
+  - 時刻は環境のローカルタイムゾーンで表示
+  - グラフのスケールは `--session-bar tokens|cost` で切替（既定: tokens）
+- 補足: 旧ライブ（イベント一覧）は `--live --live-events` で表示
 
 ## Examples
 - 直近200イベントを日別集計（TSV）
