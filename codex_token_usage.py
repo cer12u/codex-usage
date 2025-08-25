@@ -345,10 +345,14 @@ def detect_session_starts_and_state(log_path: str) -> Dict[str, Any]:
                 # Rule (a): mark pending when usage limit error appears
                 if USAGE_LIMIT_RE.search(line):
                     state["usage_limit_pending"] = True
+                    if dt is not None:
+                        state.setdefault("usage_limits", []).append(dt)
                 if RESUME_RE.search(line):
                     state["resume_pending"] = True
                 # Rule (b): if an ACTIVITY arrives with usage_limit_pending or 5h gap -> start
                 if ACTIVITY_RE.search(line):
+                    if dt is not None:
+                        state.setdefault("activities", []).append(dt)
                     if state.get("usage_limit_pending"):
                         state["session_start"] = dt
                         state["session_end"] = (dt + timedelta(hours=5)) if dt else None
@@ -384,9 +388,13 @@ def update_session_state_with_line(state: Dict[str, Any], raw_line: str) -> None
     dt = parse_ts(ts)
     if USAGE_LIMIT_RE.search(line):
         state["usage_limit_pending"] = True
+        if dt is not None:
+            state.setdefault("usage_limits", []).append(dt)
     if RESUME_RE.search(line):
         state["resume_pending"] = True
     if ACTIVITY_RE.search(line):
+        if dt is not None:
+            state.setdefault("activities", []).append(dt)
         if state.get("usage_limit_pending"):
             state["session_start"] = dt
             state["session_end"] = (dt + timedelta(hours=5)) if dt else None
@@ -403,6 +411,78 @@ def update_session_state_with_line(state: Dict[str, Any], raw_line: str) -> None
                 state["resume_pending"] = False
     if dt is not None:
         state["last_ts"] = dt
+
+
+def compute_session_origin(
+    now: datetime,
+    activities: List[datetime],
+    usage_limits: List[datetime],
+    prev_start: Optional[datetime],
+    prev_end: Optional[datetime],
+    gap_hours: float = 5.0,
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """Pure function: decide the 5h session window origin and end.
+    - If previous window exists, keep it (no sliding).
+    - Else, if there is a usage-limit, pick the first activity strictly after the latest usage-limit.
+    - Else, pick the oldest activity within [now-gap, now].
+    Returns (start, end) or (None, None).
+    """
+    if prev_start is not None and prev_end is not None:
+        return prev_start, prev_end
+
+    gap = timedelta(hours=gap_hours)
+    base = now - gap
+
+    acts = sorted([dt for dt in activities if isinstance(dt, datetime)])
+    uls = sorted([dt for dt in usage_limits if isinstance(dt, datetime)])
+
+    # usage-limit → first activity after
+    if uls:
+        t0 = uls[-1]
+        for dt in acts:
+            if dt > t0:
+                return dt, dt + gap
+        return None, None
+
+    # oldest activity within last 5h
+    cand = None
+    for dt in acts:
+        if dt >= base and (cand is None or dt < cand):
+            cand = dt
+    if cand is not None:
+        return cand, cand + gap
+
+    return None, None
+
+
+def reduce_session(
+    events: List[Dict[str, Any]],
+    start: Optional[datetime],
+    end: Optional[datetime],
+    prices_conf: Optional[Dict[str, Any]],
+    use_cached_pricing: bool = False,
+) -> Dict[str, Any]:
+    """Pure function: filter events within [start, end] and compute summary with optional cost.
+    Returns a dict compatible with summarize()/summarize_with_cost() output.
+    """
+    if start is None or end is None:
+        return {
+            "events": 0,
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0,
+            **({"cost_usd": 0.0} if prices_conf else {}),
+        }
+
+    def ev_dt(ev: Dict[str, Any]) -> Optional[datetime]:
+        return parse_ts(str(ev.get("ts", "")))
+
+    window_events = [ev for ev in events if (ev_dt(ev) or end) >= start and (ev_dt(ev) or start) <= end]
+    if prices_conf:
+        return summarize_with_cost(window_events, prices_conf, per_model=False, forced_model=None, use_cached_pricing=use_cached_pricing)
+    return summarize(window_events)
 
 
 def tail_first_activity_after(log_path: str, base_dt: datetime, tail_lines: int = 50000) -> Optional[datetime]:
