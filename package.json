@@ -1,0 +1,15 @@
+{
+  "name": "codex-usage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Codex TUI token usage and cost reporter",
+  "bin": {
+    "codex-usage": "bin/codex-usage.js"
+  },
+  "keywords": ["codex", "cli", "tokens", "usage", "cost"],
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=16"
+  }
+}
+
