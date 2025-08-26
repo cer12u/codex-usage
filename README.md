@@ -19,15 +19,15 @@ Codex TUI のログ（既定: `~/.codex/log/codex-tui.log`）から、`TokenCoun
 - Python 3.8+
 - Node.js 16+（`npx` での起動時）
 
-## Quick Start
-既定の挙動（引数なし / 引数あり）:
-- 引数なし: ライブ（セッション）表示をテーブルで表示（2秒ごと再描画, Ctrl-Cで終了）
-- 引数あり（時間指定が無い場合）: 直近30日を日別に月次レポート化（テーブル表示）
+## Quick Start（最小の使い方）
+- ライブ（セッション）表示（デフォルト）
+  - `codex-usage`
+  - JSONスナップショット: `codex-usage --json`
+- 月次（日別）レポート（直近30日）
+  - `codex-usage --monthly`
+  - JSON: `codex-usage --monthly --json`
 ```bash
-# 引数なし: ライブ（セッション）表示
-python3 codex_token_usage.py
-
-# 旧ライブ（イベント一覧）を見たい場合のみ
+# 旧ライブ（イベント一覧）を見たい場合のみ（互換）
 python3 codex_token_usage.py --live --live-events
 
 # モデル名列を含める
@@ -72,7 +72,7 @@ python3 codex_token_usage.py --daily --last-month --border ascii
 python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テーブル無効化
 ```
 
-## Output
+## Output（抜粋）
 - Per-event（TSV/CSV の列）
   - `ts`: タイムスタンプ（UTC, ISO8601風）
   - `input_tokens`
@@ -141,7 +141,7 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
   - `tests/test_costing.py`: 単価正規化とコスト算出（`compute_cost_usd`, `summarize_with_cost`）
   - `tests/test_sessions.py`: usage limit/5hギャップ→最初のアクティビティで起点をラッチするロジック（`update_session_state_with_line`, `tail_first_activity_after`）
 
-## Run via npx / uv
+## Run via npx / uv（任意）
 - npx（Node ラッパーが Python CLI を起動します）
   ```bash
   # このリポジトリ直下で
@@ -157,3 +157,9 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
   # 将来的に公開後は（エントリポイント）
   # uvx codex-usage --daily --last-month --summary --prices ./pricing.json
   ```
+
+
+## 詳細ドキュメント
+- docs/cli.md: コマンド体系（最小）
+- docs/live-session.md: ライブ（5hセッション）表示の詳細
+- docs/pricing.md: 単価・コスト計算の詳細

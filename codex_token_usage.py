@@ -1419,6 +1419,59 @@ def run_live_sessions(log_path: str, args: argparse.Namespace, prices_conf: Opti
     return 0
 
 
+def emit_live_json_snapshot(log_path: str, args: argparse.Namespace, prices_conf: Optional[Dict[str, Any]]) -> int:
+    """Emit a single JSON snapshot of the current (fixed) 5h session and exit."""
+    # Build state by scanning the log
+    session_state = detect_session_starts_and_state(log_path)
+    # Load all events once (small logs assumed; for very large logs consider tailing)
+    events: List[Dict[str, Any]] = []
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for ev in iter_events(f, include_model=args.include_model):
+                events.append(ev)
+    except Exception as e:
+        print(json.dumps({"error": f"failed to read log: {e}"}))
+        return 1
+
+    now = datetime.now(timezone.utc)
+    # Decide origin using pure function if no fixed window yet
+    start = session_state.get("session_start")
+    end = session_state.get("session_end")
+    if start is None or end is None:
+        start, end = compute_session_origin(
+            now,
+            session_state.get("activities", []),
+            session_state.get("usage_limits", []),
+            None,
+            None,
+            gap_hours=5.0,
+        )
+
+    summary = reduce_session(events, start, end, prices_conf, use_cached_pricing=getattr(args, 'cached_pricing', False))
+
+    def iso(dt: Optional[datetime]) -> Optional[str]:
+        return dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z') if isinstance(dt, datetime) else None
+
+    out = {
+        "mode": "live",
+        "start": iso(start),
+        "end": iso(end),
+        "now": iso(now),
+        "duration_sec": (int((min(now, end) - start).total_seconds()) if isinstance(start, datetime) and isinstance(end, datetime) else None),
+        "input_tokens": summary.get("input_tokens", 0),
+        "cached_input_tokens": summary.get("cached_input_tokens", 0),
+        "output_tokens": summary.get("output_tokens", 0),
+        "reasoning_output_tokens": summary.get("reasoning_output_tokens", 0),
+        "total_tokens": summary.get("total_tokens", 0),
+    }
+    if "cost_usd" in summary:
+        out["cost_usd"] = round(float(summary.get("cost_usd", 0.0) or 0.0), 6)
+        out["currency"] = "USD"
+
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Extract token usage from Codex TUI logs")
     ap.add_argument("--log", default=os.path.expanduser("~/.codex/log/codex-tui.log"),
@@ -1458,6 +1511,10 @@ def main() -> int:
                     help="Print totals summary to stderr at the end")
     ap.add_argument("--daily", action="store_true",
                     help="Aggregate by day (UTC) and output one row per date")
+    ap.add_argument("--monthly", action="store_true",
+                    help="Show last-30-day report (daily aggregates)")
+    ap.add_argument("--json", action="store_true",
+                    help="JSON output mode (live: snapshot; monthly: JSON array)")
 
     # Pricing options
     ap.add_argument("--prices", type=str, default=None,
@@ -1598,10 +1655,18 @@ def main() -> int:
 
     # Emit
     if args.live:
+        # JSON snapshot for live
+        if args.json:
+            return emit_live_json_snapshot(log_path, args, prices_conf)
         # Default is sessions; allow opting into legacy events table
         if args.live_events:
             return run_live(log_path, args, prices_conf)
         return run_live_sessions(log_path, args, prices_conf)
+    # monthly flag maps to daily last-30-days report
+    if args.monthly:
+        args.daily = True
+        args.last_month = True
+
     if args.daily:
         rows = aggregate_daily(events)
         # Fill zero rows for missing dates if we have a time window
