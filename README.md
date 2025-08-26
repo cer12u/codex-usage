@@ -1,19 +1,12 @@
-# codex-usage (Token Usage + Cost)
+# codex-usage（Token Usage + Cost）
 
-Codex TUI のログ（既定: `~/.codex/log/codex-tui.log`）から、`TokenCount(TokenUsage {...})` を抽出し、
-イベントごとのトークン使用量や日別の合計を出力する軽量CLIです。任意の単価表を指定すれば、従量課金の推定コストも算出できます。既定は枠付きテーブル表示です。
+Codex TUI のログ（`~/.codex/log/codex-tui.log`）からトークン使用量を抽出し、ライブ（5hセッション）と月次（日別）で見やすく集計します。単価を与えると推定コスト（$）も表示・JSON出力できます。
 
 ## Features
-- Per-event 出力（デフォルト）
-- 日別集計（`--daily`）
-- 出力形式: Table（枠付き, 既定）/ TSV / CSV / NDJSON / JSON
-- モデル名列の付与（`--include-model`）
-- 直近 N イベントへの絞り込み（`--last`）
-- 期間フィルタ（`--last-month`, `--since-days`, `--since-date`）
-- 単価からのコスト計算（`--prices` または `--usd-per-1k-*`）
-  - 自動単価取得: Helicone の公開API（OpenAI）から初回取得・キャッシュ（既定ON）
-  - 明示指定: `--prices pricing.json` または `--usd-per-1k-*` で上書き
-- Node ラッパー（`npx` 実行用）と Python パッケージ（`uv` 実行用）を同梱
+- Live（5hセッション）表示（デフォルト）
+- Monthly（直近30日：日別合計）
+- JSON出力（Liveスナップショット／Monthly配列）
+- 単価からのコスト算出（Helicone自動 or 明示指定）
 
 ## Requirements
 - Python 3.8+
@@ -72,7 +65,7 @@ python3 codex_token_usage.py --daily --last-month --border ascii
 python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テーブル無効化
 ```
 
-## Output（抜粋）
+## Output（概要）
 - Per-event（TSV/CSV の列）
   - `ts`: タイムスタンプ（UTC, ISO8601風）
   - `input_tokens`
@@ -106,25 +99,11 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
 - ログ内の diff/引用文字列に含まれるパターンは除外し、実際の `TokenCount` イベントのみを対象にしています。
 - ログが極端に大きい場合は `--last` を併用するとメモリを節約できます。
 
-## Live セッション表示（デフォルト）
-- 起点の決定（暫定ロジック）
-  - usage limit エラーの後に発生した「最初のアクティビティ（ExecCommandBegin/TaskStarted/TokenCount）」を起点に採用
-  - または、直前のログ行から5時間以上の無活動ギャップ後に発生した「最初のアクティビティ」を起点に採用
-  - 起動時に起点が未確定のときは、「現在 − 5時間」以降で最も古いアクティビティを起点に固定（見つからない場合は起点未設定で N/A）
-- セッションの長さ: 起点から 5 時間で固定（起点はスライドしません）
-  - 5時間に達したら集計を止め、次のトリガ（usage limit→SessionConfigured、または5hギャップ→SessionConfigured）まで N/A 行を表示
-- 表示項目: `start — end`, `duration`, `input (cached)`, `output (reasoning)`, `total`, `$`, 横棒グラフ
-  - 時刻は環境のローカルタイムゾーンで表示
-  - グラフのスケールは `--session-bar tokens|cost` で切替（既定: tokens）
-- 補足: 旧ライブ（イベント一覧）は `--live --live-events` で表示
+## Live（5hセッション）
+- 仕様の詳細は docs/live-session.md を参照してください。
 
 ## Examples
-- 直近200イベントを日別集計（TSV）
-  ```
-  date	events	input_tokens	cached_input_tokens	output_tokens	reasoning_output_tokens	total_tokens
-  2025-08-23	126	7526347	6739200	38038	19840	7564385
-  2025-08-25	74	2287852	2027264	33664	21312	2321516
-  ```
+より多くの例は docs/cli.md を参照してください。
 
 ## Development
 - フォーマット/型チェックは特に依存なし。必要に応じて `ruff`/`black` 等をお好みで導入してください。
@@ -145,7 +124,7 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
 - npx（Node ラッパーが Python CLI を起動します）
   ```bash
   # このリポジトリ直下で
-  npx . --daily --last-month --summary --prices ./pricing.example.json
+  npx . --monthly --json --prices ./pricing.example.json
   # 将来的にnpm公開後は
   # npx codex-usage --daily --last-month --summary --prices ./pricing.json
   ```
@@ -153,7 +132,7 @@ python3 codex_token_usage.py --no-table --daily --last-month --format tsv  # テ
 - uv（Pythonパッケージとして実行）
   ```bash
   # ローカルから直接
-  uv run codex_token_usage.py --daily --last-month --summary --prices ./pricing.example.json
+  uv run codex_token_usage.py --monthly --json --prices ./pricing.example.json
   # 将来的に公開後は（エントリポイント）
   # uvx codex-usage --daily --last-month --summary --prices ./pricing.json
   ```
