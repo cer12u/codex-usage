@@ -1666,6 +1666,9 @@ def main() -> int:
     if args.monthly:
         args.daily = True
         args.last_month = True
+    # --json shortcut for monthly/daily
+    if args.json and (args.daily or args.monthly):
+        args.format = "json"
 
     if args.daily:
         rows = aggregate_daily(events)
